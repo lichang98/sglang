@@ -227,24 +227,14 @@ class HPCGlm46AttentionBackend(AttentionBackend):
 
         import hpc
 
-        # The dynamic split-K assigner floors per-CTA work at min_process_len
-        # tokens (hpc default 512). For a shallow request the whole KV then
-        # lands on a single CTA per KV head, so attention cost grows linearly
-        # with context while most SMs idle. Drop the floor to one 64-token
-        # tile only when the deepest request is <= 1K tokens: the split-K
-        # combine kernel scans each (request, head) chunk serially, so for
-        # deeper requests the finer split's extra chunk count costs more
-        # than the added parallelism saves (measured at 40K: 64 vs 38 us per
-        # layer for 5-tile vs 8-tile chunks).
+        # No split-K floor: the combine kernel reduces chunks in parallel
+        # across warps, so chunk overhead stays ~50ns/chunk even at 128+
+        # chunks. The assigner's ceil-balance rule then yields the optimum at
+        # every depth: chunks = min(num_ctas, tiles), all resident CTAs busy.
+        # (With the old serial-scan combine, chunk count dominated and a
+        # 512-token floor won at 40K; floor=64 now wins by ~0.5ms/iter.)
         num_seq_q = mtp + 1
-        if forward_batch.seq_lens_cpu is not None:
-            max_kv_len = (
-                int(forward_batch.seq_lens_cpu[:bs].max().item()) + num_seq_q
-            )
-            max_kv_tiles = (max_kv_len + PAGE_SIZE - 1) // PAGE_SIZE
-            min_process_len = 64 if max_kv_tiles <= 16 else 512
-        else:
-            min_process_len = 512
+        min_process_len = 64
         # Perf A/B knob: force a fixed split-K floor (e.g. 64/256/512/1024).
         mpl_override = int(os.environ.get("SGLANG_HPC_MIN_PROCESS_LEN", "0"))
         if mpl_override > 0:
