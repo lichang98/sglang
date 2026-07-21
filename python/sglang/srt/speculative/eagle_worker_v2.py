@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -432,6 +433,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 TRTLLMHAAttnBackend,
                 TokenspeedMLABackend,
                 FlashInferAttnBackend,
+                FlashAttentionBackend,
             ),
         )
         supports_cuda_draft_extend_graph = (
