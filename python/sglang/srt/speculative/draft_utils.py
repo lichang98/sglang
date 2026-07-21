@@ -61,6 +61,7 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
+            "hpc_glm46": self._create_triton_decode_backend,
         }
 
         return self._create_backend(
@@ -91,6 +92,7 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
+            "hpc_glm46": self._create_triton_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"

@@ -249,6 +249,13 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
+@register_attention_backend("hpc_glm46")
+def create_hpc_glm46_backend(runner):
+    from sglang.srt.layers.attention.hpc_glm46_backend import HPCGlm46AttentionBackend
+
+    return HPCGlm46AttentionBackend(runner)
+
+
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't

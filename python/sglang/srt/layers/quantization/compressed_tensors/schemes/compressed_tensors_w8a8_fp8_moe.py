@@ -19,7 +19,13 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
+    fp8_max,
+    fp8_min,
+    is_fp8_fnuz,
+    scaled_fp8_quant,
+)
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -46,6 +52,33 @@ if _use_aiter:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _requant_fp8_weight_blockwise(
+    weight_fp8: torch.Tensor,
+    weight_scale_per_channel: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Dequantize per-channel fp8 weights, requantize per 128x128 block.
+    # Handles dims not divisible by 128 (partial last blocks) — the GEMM
+    # kernel's TMA bounds-checking zero-fills OOB elements in the last tile,
+    # so weights are stored unpadded. Zero padding only affects scale
+    # computation (amax of zeros = 0, no effect on real-block scales).
+    # weight_fp8: [n, k] fp8, weight_scale_per_channel: [n, 1] float32.
+    # Returns (fp8 weight [n, k] unpadded, block scales [ceil(n/128), ceil(k/128)]).
+    w = per_tensor_dequantize(weight_fp8, weight_scale_per_channel)
+    n, k = w.shape
+    bn, bk = (n + 127) // 128, (k + 127) // 128
+    pad_n, pad_k = bn * 128, bk * 128
+    if (n, k) != (pad_n, pad_k):
+        padded = torch.zeros(pad_n, pad_k, dtype=w.dtype, device=w.device)
+        padded[:n, :k] = w
+        w = padded
+    wb = w.view(bn, 128, bk, 128)
+    amax = wb.abs().to(torch.float32).amax(dim=(1, 3)).clamp_(min=1e-12)
+    scales = amax / fp8_max
+    q = (wb / scales.view(bn, 1, bk, 1)).clamp_(fp8_min, fp8_max).to(fp8_dtype)
+    q = q.view(pad_n, pad_k)[:n, :k].contiguous()
+    return q, scales
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
@@ -313,6 +346,126 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
+        # Requantize per-channel weights for the HPC backend.
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and get_moe_runner_backend().is_hpc()
+        ):
+            n13, k13 = layer.w13_weight.shape[1], layer.w13_weight.shape[2]
+            n2, k2 = layer.w2_weight.shape[1], layer.w2_weight.shape[2]
+            inter = k2
+            # TP-sharded intermediate (e.g. 1536/8=192) may not be a 128 multiple.
+            # The HPC blockwise GEMM kernel's TMA bounds-checking zero-fills OOB
+            # elements in the last partial 128-wide k-tile, so weights are stored
+            # unpadded. Each partial block gets its own scale (amax over real
+            # elements only; zero-padding contributes 0 to amax).
+            use_blockwise = k13 % 128 == 0 and n2 % 128 == 0 and n13 == 2 * inter
+            if use_blockwise:
+                # 128x128-block weight scales + per-token-block activation scales.
+                # The per-tensor variant collapses precision on long batches with
+                # massive-activation outlier tokens (one global activation scale).
+                def _ceil4(x: int) -> int:
+                    return (x + 3) // 4 * 4
+
+                w13_bn = (n13 + 127) // 128
+                w13_bk = (k13 + 127) // 128
+                w2_bn = (n2 + 127) // 128
+                w2_bk = (k2 + 127) // 128
+                w13_q = torch.empty(
+                    layer.num_local_experts,
+                    n13,
+                    k13,
+                    dtype=layer.w13_weight.dtype,
+                    device=layer.w13_weight.device,
+                )
+                w2_q = torch.empty(
+                    layer.num_local_experts,
+                    n2,
+                    k2,
+                    dtype=layer.w2_weight.dtype,
+                    device=layer.w2_weight.device,
+                )
+                w13_bs = torch.empty(
+                    layer.num_local_experts,
+                    w13_bn,
+                    _ceil4(w13_bk),
+                    dtype=torch.float32,
+                    device=layer.w13_weight.device,
+                )
+                w2_bs = torch.empty(
+                    layer.num_local_experts,
+                    w2_bn,
+                    _ceil4(w2_bk),
+                    dtype=torch.float32,
+                    device=layer.w2_weight.device,
+                )
+                for expert_id in range(layer.num_local_experts):
+                    # Requant the entire gate_up [n13, k13] as one piece. For
+                    # GLM-4.6 (n13=384=3*128) this yields 3 n-blocks aligned to
+                    # 128-tiling, vs 4 misaligned n-blocks (2+2) if gate/up
+                    # halves were requanted separately.
+                    q13, s13 = _requant_fp8_weight_blockwise(
+                        layer.w13_weight[expert_id],
+                        layer.w13_weight_scale[expert_id],
+                    )
+                    w13_q[expert_id] = q13
+                    w13_bs[expert_id, :, : s13.shape[1]] = s13
+                    if s13.shape[1] < w13_bs.shape[2]:
+                        w13_bs[expert_id, :, s13.shape[1] :] = 1.0
+                    q2, s2 = _requant_fp8_weight_blockwise(
+                        layer.w2_weight[expert_id],
+                        layer.w2_weight_scale[expert_id],
+                    )
+                    w2_q[expert_id] = q2
+                    w2_bs[expert_id, :, : s2.shape[1]] = s2
+                    if s2.shape[1] < w2_bs.shape[2]:
+                        w2_bs[expert_id, :, s2.shape[1] :] = 1.0
+                if get_bool_env_var("SGLANG_HPC_MOE_KEEP_ORIG"):
+                    # Stash the original per-channel weights/scales so the
+                    # runner's fp32 emulation can isolate the requant's
+                    # precision impact (SGLANG_HPC_MOE_REF_WEIGHTS=orig).
+                    layer.w13_weight_orig = layer.w13_weight
+                    layer.w13_weight_scale_orig = layer.w13_weight_scale
+                    layer.w2_weight_orig = layer.w2_weight
+                    layer.w2_weight_scale_orig = layer.w2_weight_scale
+                layer.w13_weight = torch.nn.Parameter(w13_q, requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(w2_q, requires_grad=False)
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    w13_bs.amax(dim=[1, 2]), requires_grad=False
+                )
+                layer.w2_weight_scale = torch.nn.Parameter(
+                    w2_bs.amax(dim=[1, 2]), requires_grad=False
+                )
+                layer.w13_block_scale = w13_bs
+                layer.w2_block_scale = w2_bs
+            else:
+                # HPC kernel only supports per-expert (per-tensor) dequant scales.
+                max_w13_scales = layer.w13_weight_scale.amax(dim=[1, 2])  # [E]
+                max_w2_scales = layer.w2_weight_scale.amax(dim=[1, 2])  # [E]
+                for expert_id in range(layer.num_local_experts):
+                    dq_w13 = per_tensor_dequantize(
+                        layer.w13_weight[expert_id],
+                        layer.w13_weight_scale[expert_id],
+                    )
+                    (
+                        layer.w13_weight[expert_id],
+                        _,
+                    ) = scaled_fp8_quant(dq_w13, max_w13_scales[expert_id])
+                    dq_w2 = per_tensor_dequantize(
+                        layer.w2_weight[expert_id],
+                        layer.w2_weight_scale[expert_id],
+                    )
+                    (
+                        layer.w2_weight[expert_id],
+                        _,
+                    ) = scaled_fp8_quant(dq_w2, max_w2_scales[expert_id])
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    max_w13_scales, requires_grad=False
+                )
+                layer.w2_weight_scale = torch.nn.Parameter(
+                    max_w2_scales, requires_grad=False
+                )
+
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
             with torch.no_grad():
                 # Pre-shuffle weights
@@ -360,7 +513,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_hpc()
         ):
+            if moe_runner_backend.is_hpc():
+                import sglang.srt.layers.moe.moe_runner.hpc  # noqa: F401
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -376,6 +532,40 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
+
+        if self.runner.runner_backend.is_hpc():
+            from sglang.srt.layers.moe.moe_runner.hpc import HpcMoeQuantInfo
+
+            if self.weight_quant.strategy == QuantizationStrategy.BLOCK:
+                w13_scale = 1.0 / layer.w13_weight_scale.amin(dim=[1, 2])
+                w2_scale = 1.0 / layer.w2_weight_scale.amin(dim=[1, 2])
+            elif self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
+                if layer.w13_weight_scale.dim() > 1:
+                    w13_scale = layer.w13_weight_scale.amax(dim=[1, 2])
+                    w2_scale = layer.w2_weight_scale.amax(dim=[1, 2])
+                else:
+                    w13_scale = layer.w13_weight_scale
+                    w2_scale = layer.w2_weight_scale
+            else:
+                w13_scale = layer.w13_weight_scale
+                w2_scale = layer.w2_weight_scale
+
+            quant_info = HpcMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                num_experts=layer.num_experts,
+                w13_block_scale=getattr(layer, "w13_block_scale", None),
+                w2_block_scale=getattr(layer, "w2_block_scale", None),
+                w13_weight_orig=getattr(layer, "w13_weight_orig", None),
+                w13_scale_orig=getattr(layer, "w13_weight_scale_orig", None),
+                w2_weight_orig=getattr(layer, "w2_weight_orig", None),
+                w2_scale_orig=getattr(layer, "w2_weight_scale_orig", None),
+                a13_scale=getattr(layer, "w13_input_scale", None),
+                a2_scale=getattr(layer, "w2_input_scale", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if self.runner.runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import (

@@ -1808,7 +1808,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_hpc()
         ):
+            if moe_runner_backend.is_hpc():
+                import sglang.srt.layers.moe.moe_runner.hpc  # noqa: F401
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -2064,6 +2067,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
+        elif self.runner.runner_backend.is_hpc():
+            from sglang.srt.layers.moe.moe_runner.hpc import HpcMoeQuantInfo
+
+            if self.block_quant:
+                # weight_scale_inv is quant scale (1/dequant), shape [E, ...]
+                # Kernel expects dequant scale per expert: 1/min(quant) = max(dequant)
+                w13_scale = 1.0 / layer.w13_weight_scale_inv.amin(dim=[1, 2])
+                w2_scale = 1.0 / layer.w2_weight_scale_inv.amin(dim=[1, 2])
+            else:
+                # w13_weight_scale is [E, 2] (gate/up pair), reduce to [E]
+                w13_scale = layer.w13_weight_scale.amax(dim=1)
+                w2_scale = layer.w2_weight_scale  # already [E]
+
+            quant_info = HpcMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                num_experts=int(getattr(layer, "num_experts")),
+            )
         else:
             raise NotImplementedError(
                 "Unsupported runner backend: %s" % self.runner.runner_backend

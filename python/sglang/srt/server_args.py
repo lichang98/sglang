@@ -4229,19 +4229,20 @@ class ServerArgs:
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            quant_method = (
+                quantization_config.get("quant_method")
+                if quantization_config is not None
+                else None
+            )
+            if (
+                self.quantization is None
+                and not self._quantization_explicitly_unset
+                and quant_method is not None
+            ):
+                self.quantization = quant_method
+
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
-                if (
-                    self.quantization is None
-                    and not self._quantization_explicitly_unset
-                    and quant_method is not None
-                ):
-                    self.quantization = quant_method
                 if (
                     self.quantization == "modelopt_fp4"
                     and self.moe_a2a_backend == "none"
@@ -4250,6 +4251,27 @@ class ServerArgs:
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
+                    )
+            elif is_sm90_supported():
+                if self.attention_backend is None:
+                    self.attention_backend = "hpc_glm46"
+                    logger.info(
+                        "Use hpc_glm46 attention backend on sm90 for Glm4MoeForCausalLM"
+                    )
+                if self.page_size is None:
+                    self.page_size = 64
+                if self.kv_cache_dtype == "auto":
+                    self.kv_cache_dtype = "fp8_e4m3"
+                    logger.info(
+                        "Use fp8_e4m3 KV cache dtype on sm90 for Glm4MoeForCausalLM"
+                    )
+                if (
+                    self.moe_a2a_backend == "none"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    self.moe_runner_backend = "hpc"
+                    logger.info(
+                        "Use hpc as MoE runner backend on sm90 for Glm4MoeForCausalLM"
                     )
 
         elif model_arch in [
