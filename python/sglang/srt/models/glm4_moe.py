@@ -364,6 +364,40 @@ class Glm4MoeAttention(nn.Module):
         return self.forward_core(s)
 
 
+if _is_cuda:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _glm4_moe_gate_kernel(
+        hidden_ptr,
+        weight_ptr,
+        out_ptr,
+        M,
+        stride_hm,
+        stride_wn,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        M_PAD: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        # One program per expert row; fp32 FMA accumulate over K in registers.
+        # Exact fp32 math (bf16 upcast is lossless), deterministic per config.
+        n = tl.program_id(0)
+        offs_m = tl.arange(0, M_PAD)
+        offs_k = tl.arange(0, BLOCK_K)
+        acc = tl.zeros((M_PAD, BLOCK_K), dtype=tl.float32)
+        h_ptrs = hidden_ptr + offs_m[:, None] * stride_hm + offs_k[None, :]
+        m_mask = offs_m[:, None] < M
+        w_ptrs = weight_ptr + n * stride_wn + offs_k
+        for k0 in range(0, K, BLOCK_K):
+            h = tl.load(h_ptrs + k0, mask=m_mask, other=0.0)
+            w = tl.load(w_ptrs + k0)
+            acc += h.to(tl.float32) * w.to(tl.float32)[None, :]
+        out = tl.sum(acc, axis=1)
+        tl.store(out_ptr + offs_m * N + n, out, mask=offs_m < M)
+
+
 class Glm4MoeGate(nn.Module):
     def __init__(
         self,
@@ -384,6 +418,40 @@ class Glm4MoeGate(nn.Module):
     def forward(self, hidden_states):
         if self._weight_fp32 is None:
             self._weight_fp32 = self.weight.data.to(torch.float32)
+        # Small-M fast path: F.linear on fp32 makes cublasLt pick a splitK
+        # simt_sgemm (~18us + 4us reduce + 3us cast per layer at M=4). The
+        # triton kernel does the same fp32-accumulated projection in ~3us and
+        # fuses the bf16->fp32 cast.
+        if (
+            _is_cuda
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and 0 < hidden_states.shape[0] <= 16
+            and hidden_states.stride(1) == 1
+            and self._weight_fp32.stride(1) == 1
+            and self._weight_fp32.shape[1] % 128 == 0
+        ):
+            num_tokens = hidden_states.shape[0]
+            num_experts, hidden_size = self._weight_fp32.shape
+            logits = torch.empty(
+                (num_tokens, num_experts),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            _glm4_moe_gate_kernel[(num_experts,)](
+                hidden_states,
+                self._weight_fp32,
+                logits,
+                num_tokens,
+                hidden_states.stride(0),
+                self._weight_fp32.stride(0),
+                N=num_experts,
+                K=hidden_size,
+                M_PAD=16,
+                BLOCK_K=128,
+                num_warps=4,
+            )
+            return logits
         logits = F.linear(hidden_states.to(torch.float32), self._weight_fp32, None)
         return logits
 
