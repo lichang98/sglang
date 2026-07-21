@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 PAGE_SIZE = 64
 HEADS_PER_GROUP = 12
+# SM90 dynamic split-K launches this many CTAs per SM for num_seq_q = 1..4
+# (mirrors kCtaPerSmMap in HPC-Ops sched_task_info.h).
+_SM90_CTA_PER_SM = (4, 3, 3, 2)
 
 
 @dataclass
@@ -50,7 +53,8 @@ class HPCGlm46PrefillMetadata:
 
 
 class HPCGlm46AttentionBackend(AttentionBackend):
-    needs_cpu_seq_lens: bool = False
+    # Needs seq_lens_cpu for the adaptive split-K floor in decode metadata init.
+    needs_cpu_seq_lens: bool = True
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -67,6 +71,9 @@ class HPCGlm46AttentionBackend(AttentionBackend):
         self.v_head_dim = model_runner.model_config.v_head_dim
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        self.sm_count = torch.cuda.get_device_properties(
+            self.device
+        ).multi_processor_count
         self.page_size = model_runner.server_args.page_size
         self.ones_scale = torch.ones((1,), dtype=torch.float32, device=self.device)
         self.forward_metadata: Optional[HPCGlm46DecodeMetadata] = None
@@ -226,12 +233,29 @@ class HPCGlm46AttentionBackend(AttentionBackend):
 
         import hpc
 
+        # The dynamic split-K assigner floors per-CTA work at min_process_len
+        # tokens (hpc default 512). At small bs*seqlen the whole KV then lands
+        # on a single CTA per (request, KV head), so decode attention cost
+        # grows linearly with context while most SMs idle. Drop the floor to
+        # one 64-token tile when the batch cannot fill the GPU anyway.
+        num_seq_q = mtp + 1
+        num_ctas = self.sm_count * _SM90_CTA_PER_SM[min(num_seq_q, 4) - 1]
+        if forward_batch.seq_lens_cpu is not None:
+            max_kv_len = (
+                int(forward_batch.seq_lens_cpu[:bs].max().item()) + num_seq_q
+            )
+            total_tiles = bs * ((max_kv_len + PAGE_SIZE - 1) // PAGE_SIZE)
+            min_process_len = 64 if total_tiles < 8 * num_ctas else 512
+        else:
+            min_process_len = 512
+
         hpc.assign_attention_decode_task(
             self.cuda_graph_seq_lens[:bs],
             self.cuda_graph_task_map,
             self.num_kv_heads,
-            mtp + 1,
+            num_seq_q,
             True,
+            min_process_len=min_process_len,
         )
 
         self.forward_metadata = HPCGlm46DecodeMetadata(
