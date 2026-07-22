@@ -1196,6 +1196,139 @@ def _biased_grouped_topk_postprocess(
     return topk_ids
 
 
+if _is_cuda:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _biased_grouped_topk_small_m_kernel(
+        gating_ptr,
+        bias_ptr,
+        out_w_ptr,
+        out_ids_ptr,
+        stride_gm,
+        routed_scaling_factor,
+        M,
+        E: tl.constexpr,
+        G: tl.constexpr,
+        EPG: tl.constexpr,
+        TG: tl.constexpr,
+        K: tl.constexpr,
+        RENORM: tl.constexpr,
+        APPLY_RSF: tl.constexpr,
+        M_PAD: tl.constexpr,
+        E_PAD: tl.constexpr,
+        EPG_PAD: tl.constexpr,
+        K_PAD: tl.constexpr,
+    ):
+        # Whole biased grouped top-k in one launch for tiny batches. Matches
+        # biased_grouped_topk_impl semantics for num_fused_shared_experts == 1:
+        # sigmoid -> +bias -> group top2-sum -> select TG groups -> expert top-K
+        # (descending) -> shared expert column (id=E, weight=sum/rsf) -> renorm.
+        offs_m = tl.arange(0, M_PAD)
+        m_mask = offs_m < M
+
+        offs_e = tl.arange(0, E_PAD)
+        e_mask = offs_e < E
+        gate_f = tl.load(
+            gating_ptr + offs_m[:, None] * stride_gm + offs_e[None, :],
+            mask=m_mask[:, None] & e_mask[None, :],
+            other=float("-inf"),
+        )
+        scores_f = tl.sigmoid(gate_f)
+        bias_f = tl.load(bias_ptr + offs_e, mask=e_mask, other=0.0)
+        sfc_f = scores_f + bias_f[None, :]
+        sfc_f = tl.where(e_mask[None, :], sfc_f, float("-inf"))
+
+        offs_g = tl.arange(0, G)
+        offs_w = tl.arange(0, EPG_PAD)
+        w_mask = offs_w < EPG
+        e2 = offs_g[:, None] * EPG + offs_w[None, :]
+        gate_g = tl.load(
+            gating_ptr + offs_m[:, None, None] * stride_gm + e2[None, :, :],
+            mask=m_mask[:, None, None] & w_mask[None, :, :],
+            other=float("-inf"),
+        )
+        scores_g = tl.sigmoid(gate_g)
+        bias_g = tl.load(bias_ptr + e2, mask=w_mask, other=0.0)
+        sfc_g = scores_g + bias_g[None, :, :]
+        sfc_g = tl.where(w_mask[None, :, :], sfc_g, float("-inf"))
+
+        idx1 = tl.argmax(sfc_g, axis=2)
+        max1 = tl.max(sfc_g, axis=2)
+        second = tl.where(
+            offs_w[None, None, :] == idx1[:, :, None], float("-inf"), sfc_g
+        )
+        group_scores = max1 + tl.max(second, axis=2)
+
+        sel_g = tl.zeros((M_PAD, G), dtype=tl.int32)
+        for _ in tl.static_range(TG):
+            gi = tl.argmax(group_scores, axis=1)
+            group_scores = tl.where(
+                offs_g[None, :] == gi[:, None], float("-inf"), group_scores
+            )
+            sel_g += (offs_g[None, :] == gi[:, None]).to(tl.int32)
+
+        group_of_e = offs_e // EPG
+        sel_f = (
+            tl.sum(
+                tl.where(
+                    (group_of_e[None, None, :] == offs_g[None, :, None])
+                    & (sel_g[:, :, None] > 0),
+                    1,
+                    0,
+                ),
+                axis=1,
+            )
+            > 0
+        )
+
+        tmp = tl.where(sel_f & e_mask[None, :], sfc_f, float("-inf"))
+
+        offs_k = tl.arange(0, K_PAD)
+        w_tile = tl.zeros((M_PAD, K_PAD), dtype=tl.float32)
+        id_tile = tl.zeros((M_PAD, K_PAD), dtype=tl.int32)
+        wsum = tl.zeros((M_PAD,), dtype=tl.float32)
+        for k in tl.static_range(K):
+            idx = tl.argmax(tmp, axis=1)
+            w = tl.sum(
+                tl.where(offs_e[None, :] == idx[:, None], scores_f, 0.0), axis=1
+            )
+            wsum += w
+            col = offs_k[None, :] == k
+            w_tile = tl.where(col, w[:, None], w_tile)
+            id_tile = tl.where(col, idx[:, None].to(tl.int32), id_tile)
+            tmp = tl.where(offs_e[None, :] == idx[:, None], float("-inf"), tmp)
+
+        # Shared-expert column (id=E) takes sum(routed weights)/rsf pre-renorm.
+        w_shared = wsum / routed_scaling_factor
+        if RENORM:
+            w_tile = w_tile / wsum[:, None]
+            w_shared = w_shared / wsum
+        if APPLY_RSF:
+            w_tile = w_tile * routed_scaling_factor
+            w_shared = w_shared * routed_scaling_factor
+
+        out_stride = K + 1
+        out_mask = m_mask[:, None] & (offs_k[None, :] < K)
+        tl.store(
+            out_w_ptr + offs_m[:, None] * out_stride + offs_k[None, :],
+            w_tile,
+            mask=out_mask,
+        )
+        tl.store(
+            out_ids_ptr + offs_m[:, None] * out_stride + offs_k[None, :],
+            id_tile,
+            mask=out_mask,
+        )
+        tl.store(out_w_ptr + offs_m * out_stride + K, w_shared, mask=m_mask)
+        tl.store(
+            out_ids_ptr + offs_m * out_stride + K,
+            tl.full((M_PAD,), E, tl.int32),
+            mask=m_mask,
+        )
+
+
 def biased_grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1217,6 +1350,58 @@ def biased_grouped_topk_gpu(
 
     # topk for routed experts only (shared experts are appended separately below)
     topk_routed = topk - num_fused_shared_experts
+    if (
+        _is_cuda
+        and num_fused_shared_experts == 1
+        and gating_output.is_cuda
+        and gating_output.dtype == torch.float32
+        and 0 < num_tokens <= 16
+        and gating_output.stride(1) == 1
+        and correction_bias is not None
+        and correction_bias.dtype == torch.float32
+        and correction_bias.is_contiguous()
+        and num_expert_group is not None
+        and num_expert_group >= 1
+        and is_power_of_two(num_expert_group)
+        and num_experts % num_expert_group == 0
+        and experts_per_group >= 2
+        and topk_group is not None
+        and 1 <= topk_group <= num_expert_group
+        and 1 <= topk_routed <= 16
+        and num_experts <= 512
+        and routed_scaling_factor is not None
+    ):
+        # Small-M fast path: the torch-native fallback runs ~12 tiny kernels
+        # (sigmoid/topk/sort/mask/gather, ~25us/layer at 40K decode); the fused
+        # kernel does the whole routing in one launch.
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        )
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
+        _biased_grouped_topk_small_m_kernel[(1,)](
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            gating_output.stride(0),
+            float(routed_scaling_factor),
+            num_tokens,
+            E=num_experts,
+            G=num_expert_group,
+            EPG=experts_per_group,
+            TG=topk_group,
+            K=topk_routed,
+            RENORM=renormalize,
+            APPLY_RSF=bool(apply_routed_scaling_factor_on_output),
+            M_PAD=16,
+            E_PAD=triton.next_power_of_2(num_experts),
+            EPG_PAD=triton.next_power_of_2(experts_per_group),
+            K_PAD=triton.next_power_of_2(topk_routed),
+            num_warps=4,
+        )
+        return topk_weights, topk_ids
     if (
         _is_cuda
         and fused_topk_deepseek is not None

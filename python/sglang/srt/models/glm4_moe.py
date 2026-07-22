@@ -397,6 +397,39 @@ if _is_cuda:
         out = tl.sum(acc, axis=1)
         tl.store(out_ptr + offs_m * N + n, out, mask=offs_m < M)
 
+    @triton.jit
+    def _glm4_moe_gate_dot_kernel(
+        hidden_ptr,
+        weight_ptr,
+        out_ptr,
+        M,
+        stride_hm,
+        stride_wn,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        M_PAD: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        # Tensor-core variant on the bf16 weight: bf16 x bf16 products are
+        # exact in fp32, so numerics match the fp32 FMA kernel up to
+        # accumulation order. Few large programs instead of one per expert.
+        pid = tl.program_id(0)
+        offs_m = tl.arange(0, M_PAD)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        acc = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
+        h_ptrs = hidden_ptr + offs_m[:, None] * stride_hm + offs_k[None, :]
+        w_ptrs = weight_ptr + offs_n[:, None] * stride_wn + offs_k[None, :]
+        for k0 in range(0, K, BLOCK_K):
+            h = tl.load(h_ptrs + k0, mask=offs_m[:, None] < M, other=0.0)
+            w = tl.load(w_ptrs + k0, mask=offs_n[:, None] < N, other=0.0)
+            acc = tl.dot(h, tl.trans(w), acc)
+        out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(
+            out_ptr + offs_m[:, None] * N + offs_n[None, :], acc, mask=out_mask
+        )
+
 
 class Glm4MoeGate(nn.Module):
     def __init__(
@@ -438,6 +471,28 @@ class Glm4MoeGate(nn.Module):
                 dtype=torch.float32,
                 device=hidden_states.device,
             )
+            if (
+                self.weight.dtype == torch.bfloat16
+                and self.weight.stride(1) == 1
+                and num_experts % 32 == 0
+                and hidden_size % 256 == 0
+            ):
+                _glm4_moe_gate_dot_kernel[(num_experts // 32,)](
+                    hidden_states,
+                    self.weight,
+                    logits,
+                    num_tokens,
+                    hidden_states.stride(0),
+                    self.weight.stride(0),
+                    N=num_experts,
+                    K=hidden_size,
+                    M_PAD=16,
+                    BLOCK_N=32,
+                    BLOCK_K=256,
+                    num_warps=4,
+                    num_stages=4,
+                )
+                return logits
             _glm4_moe_gate_kernel[(num_experts,)](
                 hidden_states,
                 self._weight_fp32,
