@@ -15,6 +15,7 @@
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
 
 import logging
+import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -111,6 +112,10 @@ _is_npu = is_npu()
 _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
+
+_DEFER_LAST_LAYER_MLP_AR = (
+    os.environ.get("SGLANG_GLM_ENABLE_DEFERRED_MLP_AR", "0") == "1"
+)
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -1004,8 +1009,11 @@ class Glm4MoeDecoderLayer(nn.Module):
             ),
             # Both Glm4MoeModel and Glm4MoeModelNextN consume the fusion tag
             # with their final norm, so the last layer can defer its MoE AR.
+            # Gated off by default: at small batch the fused trtllm AR+RMS
+            # kernel measured slower than one_shot_push AR + plain RMSNorm.
             fuse_last_layer_with_final_norm=(
-                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+                _DEFER_LAST_LAYER_MLP_AR
+                and (is_nextn or (self.layer_id == self.config.num_hidden_layers - 1))
             ),
         )
 
