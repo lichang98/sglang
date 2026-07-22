@@ -1374,6 +1374,11 @@ def biased_grouped_topk_gpu(
         # Small-M fast path: the torch-native fallback runs ~12 tiny kernels
         # (sigmoid/topk/sort/mask/gather, ~25us/layer at 40K decode); the fused
         # kernel does the whole routing in one launch.
+        # M_PAD tracks num_tokens (not a fixed 16): the kernel is a chain of
+        # dependent [M_PAD, E_PAD] tile reductions, so sizing the token dim to
+        # the real batch (4 for verify, 1-2 for draft) shortens every serial
+        # reduction ~4x and avoids register spills from oversized tiles.
+        m_pad = max(2, triton.next_power_of_2(num_tokens))
         topk_weights = torch.empty(
             (num_tokens, topk), dtype=torch.float32, device=gating_output.device
         )
@@ -1395,11 +1400,11 @@ def biased_grouped_topk_gpu(
             K=topk_routed,
             RENORM=renormalize,
             APPLY_RSF=bool(apply_routed_scaling_factor_on_output),
-            M_PAD=16,
+            M_PAD=m_pad,
             E_PAD=triton.next_power_of_2(num_experts),
             EPG_PAD=triton.next_power_of_2(experts_per_group),
             K_PAD=triton.next_power_of_2(topk_routed),
-            num_warps=4,
+            num_warps=8 if m_pad >= 16 else 4,
         )
         return topk_weights, topk_ids
     if (
