@@ -21,7 +21,9 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed import moe_tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.communicator import apply_flashinfer_allreduce_fusion
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -108,10 +110,19 @@ class Glm4MoeModelNextN(nn.Module):
             )
 
         if not forward_batch.forward_mode.is_idle():
-            if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-            else:
+            if residual is None:
                 hidden_states = self.shared_head.norm(hidden_states)
+            elif getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
+                # The decoder layer deferred its MoE all-reduce to this norm.
+                if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]):
+                    hidden_states, _ = self.shared_head.norm.forward_with_allreduce_fusion(
+                        hidden_states, residual, use_attn_tp_group=False
+                    )
+                else:
+                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            else:
+                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
         return hidden_states
 

@@ -443,6 +443,10 @@ class LayerCommunicator:
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         force_layernorm_before_dp_gather: bool = False,
+        # Set when the model's final norm consumes _sglang_needs_allreduce_fusion
+        # (via RMSNorm.forward_with_allreduce_fusion), allowing the last layer's
+        # MLP/MoE all-reduce to fuse into that norm instead of running standalone.
+        fuse_last_layer_with_final_norm: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -451,6 +455,7 @@ class LayerCommunicator:
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
+        self.fuse_last_layer_with_final_norm = fuse_last_layer_with_final_norm
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -799,7 +804,7 @@ class LayerCommunicator:
                     and get_global_server_args().enable_aiter_allreduce_fusion
                 )
             )
-            and (not self.is_last_layer)
+            and (not self.is_last_layer or self.fuse_last_layer_with_final_norm)
             and (self._context.tp_size > 1)
         )
 

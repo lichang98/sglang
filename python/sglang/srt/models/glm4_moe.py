@@ -28,6 +28,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
+    moe_tensor_model_parallel_all_reduce,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -42,6 +43,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    apply_flashinfer_allreduce_fusion,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1000,6 +1002,11 @@ class Glm4MoeDecoderLayer(nn.Module):
             is_last_layer=(
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
+            # Both Glm4MoeModel and Glm4MoeModelNextN consume the fusion tag
+            # with their final norm, so the last layer can defer its MoE AR.
+            fuse_last_layer_with_final_norm=(
+                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+            ),
         )
 
         # Detect if QKV uses aiter FP8 per-token quant so we can fuse
@@ -1280,6 +1287,17 @@ class Glm4MoeModel(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
+                elif getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
+                    # Last layer deferred its MoE all-reduce to this norm.
+                    if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]):
+                        hidden_states, _ = self.norm.forward_with_allreduce_fusion(
+                            hidden_states, residual, use_attn_tp_group=False
+                        )
+                    else:
+                        hidden_states = moe_tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
+                        hidden_states, _ = self.norm(hidden_states, residual)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
         if len(aux_hidden_states) == 0:
