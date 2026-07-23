@@ -1221,11 +1221,13 @@ if _is_cuda:
         EPG_PAD: tl.constexpr,
         K_PAD: tl.constexpr,
     ):
-        # Whole biased grouped top-k in one launch for tiny batches. Matches
+        # Whole biased grouped top-k in one launch per M_PAD-row tile. Matches
         # biased_grouped_topk_impl semantics for num_fused_shared_experts == 1:
         # sigmoid -> +bias -> group top2-sum -> select TG groups -> expert top-K
         # (descending) -> shared expert column (id=E, weight=sum/rsf) -> renorm.
-        offs_m = tl.arange(0, M_PAD)
+        # Token rows are independent, so batches beyond M_PAD use one program
+        # per M_PAD-row tile instead of growing the latency-critical tile.
+        offs_m = tl.program_id(0) * M_PAD + tl.arange(0, M_PAD)
         m_mask = offs_m < M
 
         offs_e = tl.arange(0, E_PAD)
@@ -1355,7 +1357,7 @@ def biased_grouped_topk_gpu(
         and num_fused_shared_experts == 1
         and gating_output.is_cuda
         and gating_output.dtype == torch.float32
-        and 0 < num_tokens <= 16
+        and 0 < num_tokens <= 128
         and gating_output.stride(1) == 1
         and correction_bias is not None
         and correction_bias.dtype == torch.float32
@@ -1373,19 +1375,25 @@ def biased_grouped_topk_gpu(
     ):
         # Small-M fast path: the torch-native fallback runs ~12 tiny kernels
         # (sigmoid/topk/sort/mask/gather, ~25us/layer at 40K decode); the fused
-        # kernel does the whole routing in one launch.
-        # M_PAD tracks num_tokens (not a fixed 16): the kernel is a chain of
-        # dependent [M_PAD, E_PAD] tile reductions, so sizing the token dim to
-        # the real batch (4 for verify, 1-2 for draft) shortens every serial
-        # reduction ~4x and avoids register spills from oversized tiles.
-        m_pad = max(2, triton.next_power_of_2(num_tokens))
+        # kernel does the whole routing in one launch per M_PAD-row tile.
+        # M_PAD tracks num_tokens up to 16 (not a fixed 16): the kernel is a
+        # chain of dependent [M_PAD, E_PAD] tile reductions, so sizing the
+        # token dim to the real batch (4 for verify, 1-2 for draft) shortens
+        # every serial reduction ~4x and avoids register spills from oversized
+        # tiles. Beyond 16 tokens, keep the fast 4-row tile and tile over M.
+        if num_tokens <= 16:
+            m_pad = max(2, triton.next_power_of_2(num_tokens))
+            grid = (1,)
+        else:
+            m_pad = 4
+            grid = ((num_tokens + m_pad - 1) // m_pad,)
         topk_weights = torch.empty(
             (num_tokens, topk), dtype=torch.float32, device=gating_output.device
         )
         topk_ids = torch.empty(
             (num_tokens, topk), dtype=torch.int32, device=gating_output.device
         )
-        _biased_grouped_topk_small_m_kernel[(1,)](
+        _biased_grouped_topk_small_m_kernel[grid](
             gating_output,
             correction_bias,
             topk_weights,

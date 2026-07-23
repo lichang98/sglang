@@ -390,8 +390,9 @@ if _is_cuda:
     ):
         # One program per expert row; fp32 FMA accumulate over K in registers.
         # Exact fp32 math (bf16 upcast is lossless), deterministic per config.
+        # axis 1 of the grid tiles over token rows (M_PAD rows per program).
         n = tl.program_id(0)
-        offs_m = tl.arange(0, M_PAD)
+        offs_m = tl.program_id(1) * M_PAD + tl.arange(0, M_PAD)
         offs_k = tl.arange(0, BLOCK_K)
         acc = tl.zeros((M_PAD, BLOCK_K), dtype=tl.float32)
         h_ptrs = hidden_ptr + offs_m[:, None] * stride_hm + offs_k[None, :]
@@ -421,8 +422,9 @@ if _is_cuda:
         # Tensor-core variant on the bf16 weight: bf16 x bf16 products are
         # exact in fp32, so numerics match the fp32 FMA kernel up to
         # accumulation order. Few large programs instead of one per expert.
+        # axis 1 of the grid tiles over token rows (M_PAD rows per program).
         pid = tl.program_id(0)
-        offs_m = tl.arange(0, M_PAD)
+        offs_m = tl.program_id(1) * M_PAD + tl.arange(0, M_PAD)
         offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
         acc = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
@@ -466,13 +468,14 @@ class Glm4MoeGate(nn.Module):
             _is_cuda
             and hidden_states.is_cuda
             and hidden_states.dtype == torch.bfloat16
-            and 0 < hidden_states.shape[0] <= 16
+            and 0 < hidden_states.shape[0] <= 128
             and hidden_states.stride(1) == 1
             and self._weight_fp32.stride(1) == 1
             and self._weight_fp32.shape[1] % 128 == 0
         ):
             num_tokens = hidden_states.shape[0]
             num_experts, hidden_size = self._weight_fp32.shape
+            m_tiles = (num_tokens + 15) // 16
             logits = torch.empty(
                 (num_tokens, num_experts),
                 dtype=torch.float32,
@@ -484,7 +487,7 @@ class Glm4MoeGate(nn.Module):
                 and num_experts % 32 == 0
                 and hidden_size % 256 == 0
             ):
-                _glm4_moe_gate_dot_kernel[(num_experts // 32,)](
+                _glm4_moe_gate_dot_kernel[(num_experts // 32, m_tiles)](
                     hidden_states,
                     self.weight,
                     logits,
@@ -500,7 +503,7 @@ class Glm4MoeGate(nn.Module):
                     num_stages=4,
                 )
                 return logits
-            _glm4_moe_gate_kernel[(num_experts,)](
+            _glm4_moe_gate_kernel[(num_experts, m_tiles)](
                 hidden_states,
                 self._weight_fp32,
                 logits,

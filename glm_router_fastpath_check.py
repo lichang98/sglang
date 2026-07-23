@@ -50,7 +50,13 @@ def fused_router(gating, bias, G, TG, renormalize=True, apply_rsf=False):
     EPG = E // G
     w = torch.empty((M, K_ROUTED + 1), dtype=torch.float32, device=gating.device)
     ids = torch.empty((M, K_ROUTED + 1), dtype=torch.int32, device=gating.device)
-    _biased_grouped_topk_small_m_kernel[(1,)](
+    if M <= 16:
+        m_pad = max(2, 1 << (M - 1).bit_length())
+        grid = (1,)
+    else:
+        m_pad = 4
+        grid = ((M + m_pad - 1) // m_pad,)
+    _biased_grouped_topk_small_m_kernel[grid](
         gating,
         bias,
         w,
@@ -65,11 +71,11 @@ def fused_router(gating, bias, G, TG, renormalize=True, apply_rsf=False):
         K=K_ROUTED,
         RENORM=renormalize,
         APPLY_RSF=apply_rsf,
-        M_PAD=16,
+        M_PAD=m_pad,
         E_PAD=256,
         EPG_PAD=1 << (EPG - 1).bit_length(),
         K_PAD=8,
-        num_warps=4,
+        num_warps=8 if m_pad >= 16 else 4,
     )
     return w, ids
 
@@ -78,11 +84,11 @@ weight_bf16 = torch.randn(E, H, dtype=torch.bfloat16, device="cuda") * 0.02
 bias = torch.randn(E, dtype=torch.float32, device="cuda") * 0.1
 
 print("=== gate dot kernel vs F.linear(fp32) ===")
-for M in (1, 2, 4, 8, 16):
+for M in (1, 2, 4, 8, 16, 32, 64):
     hidden = torch.randn(M, H, dtype=torch.bfloat16, device="cuda")
     ref = F.linear(hidden.to(torch.float32), weight_bf16.to(torch.float32), None)
     out = torch.empty((M, E), dtype=torch.float32, device="cuda")
-    _glm4_moe_gate_dot_kernel[(E // 32,)](
+    _glm4_moe_gate_dot_kernel[(E // 32, (M + 15) // 16)](
         hidden, weight_bf16, out, M, hidden.stride(0), weight_bf16.stride(0),
         N=E, K=H, M_PAD=16, BLOCK_N=32, BLOCK_K=256, num_warps=4, num_stages=4,
     )
@@ -98,7 +104,7 @@ print("=== fused router vs reference (ids must match exactly) ===")
 fails = 0
 for G, TG in ((8, 4), (8, 3), (1, 1), (16, 2)):
     for apply_rsf in (False, True):
-        for M in (1, 2, 3, 4, 8, 12, 16):
+        for M in (1, 2, 3, 4, 8, 12, 16, 32, 64):
             gating = torch.randn(M, E, dtype=torch.float32, device="cuda") * 3
             w_ref, id_ref = ref_router(gating, bias, G, TG, apply_rsf=apply_rsf)
             w_new, id_new = fused_router(gating, bias, G, TG, apply_rsf=apply_rsf)
@@ -112,7 +118,7 @@ for G, TG in ((8, 4), (8, 3), (1, 1), (16, 2)):
             )
 
 print("=== wrapper dispatch (biased_grouped_topk_gpu) ===")
-for M in (4, 16):
+for M in (4, 16, 32, 64):
     gating = torch.randn(M, E, dtype=torch.float32, device="cuda") * 3
     w_ref, id_ref = ref_router(gating, bias, 8, 4)
     w_new, id_new = biased_grouped_topk_gpu(
